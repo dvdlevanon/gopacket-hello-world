@@ -12,6 +12,12 @@ import (
 	"github.com/vishvananda/netns"
 )
 
+type packetInfo struct {
+	packet gopacket.Packet
+	pid    int
+	ifc    string
+}
+
 type nsStreamFactory struct{}
 type nsStream struct{}
 type nsAssemblerContext struct {
@@ -32,10 +38,10 @@ func (s *nsStream) ReassembledSG(sg reassembly.ScatterGather, ac reassembly.Asse
 	available, saved := sg.Lengths()
 	direction, start, end, skip := sg.Info()
 
-	sg.Fetch(available)
+	packet := ac.GetCaptureInfo().AncillaryData[0].(packetInfo)
 
-	fmt.Printf("ReassembledSG (available: %v) (saved: %v) (dir: %v) (start :%v) (end :%v), (skip: %v)\n",
-		available, saved, direction, start, end, skip)
+	fmt.Printf("ReassembledSG (available: %v) (saved: %v) (dir: %v) (start :%v) (end :%v), (skip: %v) (pid: %v) (ifc: %v)\n",
+		available, saved, direction, start, end, skip, packet.pid, packet.ifc)
 }
 
 func (s *nsStream) ReassemblyComplete(ac reassembly.AssemblerContext) bool {
@@ -47,7 +53,7 @@ func (a *nsAssemblerContext) GetCaptureInfo() gopacket.CaptureInfo {
 	return a.ci
 }
 
-func internalStart(pid int, ifc string, pool *reassembly.StreamPool) error {
+func internalStart(pid int, ifc string, packets chan<- packetInfo) error {
 	fmt.Printf("Listening to interface %v\n", ifc)
 
 	if pid != 0 {
@@ -84,34 +90,26 @@ func internalStart(pid int, ifc string, pool *reassembly.StreamPool) error {
 	fmt.Printf("Handle %+v\n", handle)
 	defer handle.Close()
 
-	assembler := reassembly.NewAssembler(pool)
-
-	fmt.Printf("Assembler %+v\n", assembler)
-
 	for {
 		bytes, _, err := handle.ReadPacketData()
-
-		p := gopacket.NewPacket(bytes, gopacket.DecodersByLayerName["Ethernet"], gopacket.DecodeOptions{})
 
 		if err != nil {
 			return errors.Wrap(err, 0)
 		}
 
-		tcplayer := p.TransportLayer()
-		tcp := tcplayer.(*layers.TCP)
-
-		context := &nsAssemblerContext{
-			ci: p.Metadata().CaptureInfo,
+		p := gopacket.NewPacket(bytes, gopacket.DecodersByLayerName["Ethernet"], gopacket.DecodeOptions{})
+		packets <- packetInfo{
+			packet: p,
+			pid:    pid,
+			ifc:    ifc,
 		}
-
-		assembler.AssembleWithContext(p.NetworkLayer().NetworkFlow(), tcp, context)
 	}
 }
 
-func start(wg *sync.WaitGroup, pid int, ifc string, pool *reassembly.StreamPool) error {
+func start(wg *sync.WaitGroup, pid int, ifc string, packets chan<- packetInfo) error {
 	defer wg.Done()
 
-	err := internalStart(pid, ifc, pool)
+	err := internalStart(pid, ifc, packets)
 
 	switch err := err.(type) {
 	case *errors.Error:
@@ -123,20 +121,56 @@ func start(wg *sync.WaitGroup, pid int, ifc string, pool *reassembly.StreamPool)
 	return err
 }
 
+func readPackets(assembler *reassembly.Assembler, packets <-chan packetInfo) {
+	for {
+		p, more := <-packets
+
+		if !more {
+			return
+		}
+
+		packet := p.packet
+
+		tcplayer := packet.TransportLayer()
+		tcp, ok := tcplayer.(*layers.TCP)
+
+		if !ok {
+			fmt.Printf("Non TCP packet, skipping\n")
+			continue
+		}
+		context := &nsAssemblerContext{
+			ci: packet.Metadata().CaptureInfo,
+		}
+
+		context.ci.AncillaryData = append(context.ci.AncillaryData, p)
+
+		assembler.AssembleWithContext(packet.NetworkLayer().NetworkFlow(), tcp, context)
+	}
+}
+
 func runNsReassmble() error {
 	factory := nsStreamFactory{}
 	pool := reassembly.NewStreamPool(&factory)
+	assembler := reassembly.NewAssembler(pool)
+	assembler.AssemblerOptions.MaxBufferedPagesTotal = 1000
+	assembler.AssemblerOptions.MaxBufferedPagesPerConnection = 1000
+
+	packets := make(chan packetInfo, 10000)
+
+	fmt.Printf("Assembler %+v\n", assembler)
 
 	var wg sync.WaitGroup
 
 	wg.Add(1)
-	go start(&wg, 322295, "lo", pool)
+	go start(&wg, 50503, "lo", packets)
 	wg.Add(1)
-	go start(&wg, 322323, "lo", pool)
+	go start(&wg, 50554, "lo", packets)
 	wg.Add(1)
-	go start(&wg, 0, "lo", pool)
+	go start(&wg, 0, "lo", packets)
 
+	go readPackets(assembler, packets)
 	wg.Wait()
+	close(packets)
 
 	return nil
 }
